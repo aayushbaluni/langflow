@@ -14,6 +14,7 @@ import contextvars
 import copy
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -1074,6 +1075,24 @@ async def get_component_output(
 # ---------------------------------------------------------------------------
 
 
+def _parse_ts(value: str | None) -> datetime:
+    """Parse an ISO-8601 timestamp string into a timezone-aware datetime.
+
+    Returns datetime.min (UTC) for unparseable or missing values so that
+    comparisons in validate_flow safely treat them as "old".
+    """
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    else:
+        return dt
+
+
 @mcp.tool()
 @_tracked
 async def validate_flow(flow_id: str) -> dict[str, Any]:
@@ -1094,6 +1113,9 @@ async def validate_flow(flow_id: str) -> dict[str, Any]:
     if expected == 0:
         return {"valid": True, "component_count": 0, "errors": [], "warnings": []}
 
+    # Record the time before triggering so we can ignore stale builds.
+    build_start = datetime.now(timezone.utc)
+
     # Trigger a build
     build_result = await _get_client().post(f"/build/{flow_id}/flow")
     job_id = build_result.get("job_id", "")
@@ -1101,9 +1123,7 @@ async def validate_flow(flow_id: str) -> dict[str, Any]:
         return {"valid": False, "errors": [{"error": "Build did not return a job_id"}]}
 
     # Poll until build completes or timeout.
-    # Filter by job_id so we don't pick up stale results from older builds.
-    # The monitor API may return the build identifier as "build_id" or
-    # "job_id" depending on the backend version.
+    # Only count builds whose timestamp is >= build_start to skip stale entries.
     builds: dict[str, Any] = {}
     for _ in range(30):
         await asyncio.sleep(1.0)
@@ -1111,14 +1131,9 @@ async def validate_flow(flow_id: str) -> dict[str, Any]:
         all_builds = data.get("vertex_builds", {})
         builds = {}
         for comp_id, build_list in all_builds.items():
-            matching = [b for b in build_list if b.get("build_id") == job_id or b.get("job_id") == job_id]
-            if matching:
-                builds[comp_id] = matching
-        if all_builds and not builds:
-            await logger.awarning(
-                "validate_flow: build entries exist but none match job_id=%s",
-                job_id,
-            )
+            recent = [b for b in build_list if _parse_ts(b.get("timestamp")) >= build_start]
+            if recent:
+                builds[comp_id] = recent
         if len(builds) >= expected:
             break
     else:

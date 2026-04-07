@@ -210,74 +210,11 @@ class TestCreateFlowFromSpecValidation:
 
 
 # ---------------------------------------------------------------------------
-# validate_flow: filters builds by job_id
+# validate_flow: error handling
 # ---------------------------------------------------------------------------
 
 
-class TestValidateFlowJobIdFiltering:
-    async def test_filters_by_job_id(self):
-        import asyncio
-
-        from lfx.mcp.server import validate_flow
-
-        mock_client = _make_mock_client()
-        flow = _mock_flow(nodes=[{"data": {"id": "comp-1"}}])
-
-        mock_client.post.return_value = {"job_id": "job-current"}
-
-        # Simulate monitor returning builds from both old and current job
-        monitor_response = {
-            "vertex_builds": {
-                "comp-1": [
-                    {"build_id": "job-old", "valid": True, "artifacts": {}},
-                    {"build_id": "job-current", "valid": True, "artifacts": {}},
-                ],
-            }
-        }
-        mock_client.get.return_value = monitor_response
-
-        with (
-            patch("lfx.mcp.server._get_client", return_value=mock_client),
-            patch("lfx.mcp.server._get_flow", new_callable=AsyncMock, return_value=flow),
-            patch.object(asyncio, "sleep", new_callable=AsyncMock),
-        ):
-            result = await validate_flow("flow-123")
-
-        assert result["valid"] is True
-        assert result["component_count"] == 1
-
-    async def test_ignores_stale_builds(self):
-        import asyncio
-
-        from lfx.mcp.server import validate_flow
-
-        mock_client = _make_mock_client()
-        flow = _mock_flow(nodes=[{"data": {"id": "comp-1"}}])
-
-        mock_client.post.return_value = {"job_id": "job-current"}
-
-        # Monitor only has builds from old job, none matching current
-        monitor_response = {
-            "vertex_builds": {
-                "comp-1": [
-                    {"build_id": "job-old", "valid": True, "artifacts": {}},
-                ],
-            }
-        }
-        mock_client.get.return_value = monitor_response
-
-        with (
-            patch("lfx.mcp.server._get_client", return_value=mock_client),
-            patch("lfx.mcp.server._get_flow", new_callable=AsyncMock, return_value=flow),
-            patch.object(asyncio, "sleep", new_callable=AsyncMock),
-            patch("lfx.mcp.server.logger") as mock_logger,
-        ):
-            mock_logger.awarning = AsyncMock()
-            result = await validate_flow("flow-123")
-
-        assert result["valid"] is False
-        assert "timed out" in result["errors"][0]["error"].lower()
-
+class TestValidateFlowErrorHandling:
     async def test_no_job_id_returns_error(self):
         from lfx.mcp.server import validate_flow
 
@@ -296,6 +233,7 @@ class TestValidateFlowJobIdFiltering:
 
     async def test_errors_list_format_on_component_failure(self):
         import asyncio
+        from datetime import datetime, timedelta, timezone
 
         from lfx.mcp.server import validate_flow
 
@@ -304,12 +242,13 @@ class TestValidateFlowJobIdFiltering:
 
         mock_client.post.return_value = {"job_id": "job-1"}
 
+        future = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
         monitor_response = {
             "vertex_builds": {
                 "comp-1": [
                     {
-                        "build_id": "job-1",
                         "valid": False,
+                        "timestamp": future,
                         "artifacts": {"error": "Component X failed"},
                     },
                 ],
@@ -328,6 +267,40 @@ class TestValidateFlowJobIdFiltering:
         assert len(result["errors"]) == 1
         assert result["errors"][0]["component_id"] == "comp-1"
         assert result["errors"][0]["error"] == "Component X failed"
+
+    async def test_ignores_stale_builds(self):
+        import asyncio
+
+        from lfx.mcp.server import validate_flow
+
+        mock_client = _make_mock_client()
+        flow = _mock_flow(nodes=[{"data": {"id": "comp-1"}}])
+
+        mock_client.post.return_value = {"job_id": "job-1"}
+
+        # Monitor only has builds from the past (before validate_flow was called)
+        monitor_response = {
+            "vertex_builds": {
+                "comp-1": [
+                    {
+                        "valid": True,
+                        "timestamp": "2020-01-01T00:00:00+00:00",
+                        "artifacts": {},
+                    },
+                ],
+            }
+        }
+        mock_client.get.return_value = monitor_response
+
+        with (
+            patch("lfx.mcp.server._get_client", return_value=mock_client),
+            patch("lfx.mcp.server._get_flow", new_callable=AsyncMock, return_value=flow),
+            patch.object(asyncio, "sleep", new_callable=AsyncMock),
+        ):
+            result = await validate_flow("flow-123")
+
+        assert result["valid"] is False
+        assert "timed out" in result["errors"][0]["error"].lower()
 
 
 # ---------------------------------------------------------------------------
